@@ -72,17 +72,11 @@ def calculate_theta(constraints: defaultdict[str, Attribute]) -> float:
     v_max = sum(value_list)
     return float(v_max / v_min)
 
-def adjust_value(value: float, needed: int, not_needed: int, rejected: int, processed: int) -> float:
-    boost = 1.0 + needed * 0.1
-    penalty = 1.0 - not_needed * 0.1
-    reject_boost = 1.0 + rejected / MAX_REJECT
-    return value * boost * penalty * reject_boost
 
-# def adjust_threshold(threshold: float, game_state: GameState, needed: int) -> float:
-#     reject_ratio = game_state.rejected / (game_state.processed + 1e-5)
-#     urgency = needed / game_state.num_dims
-#     acceptance_boost = (1 + urgency) / (1 + reject_ratio)
-#     return threshold / acceptance_boost
+def adjust_threshold(threshold: float, current_rejects: int, needed: int) -> float:
+    reduction = (current_rejects / MAX_REJECT) ** (1 / ((current_rejects / 100) + 1))
+    needed_reduction = 1 - ( 1 / (needed * 10) if needed > 0 else 0)
+    return threshold * (1.0 - reduction) * needed_reduction
 
 
 def read_constraints(
@@ -127,7 +121,6 @@ def exp_rp(
     threshold = 0.0
     can_allow = True
     needed = 0
-    not_needed = 0
     for attr, has_attr in person_attributes.items():
         if not has_attr:
             threshold += (2 ** game_state.constraints[attr].normalized_utilization) - 1
@@ -136,16 +129,15 @@ def exp_rp(
                 > game_state.constraints[attr].utilization
             )
         else:
-            value += game_state.constraints[attr].attribute_value
-            if (game_state.accepted - game_state.constraints[attr].utilization) < (
-                game_state.constraints[attr].min_count
-            ):
-                needed += 1
-            else:
-                not_needed += 1
-    
-    adjusted_value = adjust_value(value, needed, not_needed, game_state.rejected, game_state.processed)
-    accept = adjusted_value >= threshold and can_allow
+            needed += (
+                1
+                if (game_state.accepted - game_state.constraints[attr].utilization)
+                < (game_state.constraints[attr].min_count)
+                else 0
+            )
+    accept = (
+        value >= adjust_threshold(threshold, game_state.rejected, needed) and can_allow
+    )
     if accept:
         for attr in game_state.constraints:
             if not person_attributes[attr]:
@@ -200,7 +192,50 @@ def initialize_game(scenario: int) -> GameState | None:
     except requests.exceptions.RequestException as e:
         print(f"Error starting new game: {e}")
         return None
-    
+
+
+def run_game(game_state: GameState, sleep_time: float):
+    # first person, by not specifying accept
+    try:
+        response = requests.get(decide_and_next_url(game_state.game_id, 0))
+        response.raise_for_status()
+        data = response.json()
+        while data["status"] == "running":
+            person = data["nextPerson"]
+            person_attributes = person["attributes"]
+            accept, game_state = should_accept(person_attributes, game_state)
+            if accept:
+                game_state.accepted += 1
+                if not game_state.all_constraints_satisfied:
+                    game_state.all_constraints_satisfied = all(
+                        (game_state.accepted - game_state.constraints[attr].utilization)
+                        >= (game_state.constraints[attr].min_count)
+                        for attr in game_state.constraints.keys()
+                    )
+            else:
+                game_state.rejected += 1
+            sleep(sleep_time)
+            response = requests.get(
+                decide_and_next_url(
+                    game_state.game_id,
+                    person["personIndex"],
+                    accept,
+                )
+            )
+            game_state.processed += 1
+            if game_state.processed % 100 == 0:
+                print(
+                    f"Processed={game_state.processed}; In={game_state.accepted}; Out={game_state.rejected};"
+                )
+            response.raise_for_status()
+            data = response.json()
+        if data["status"] == "failed":
+            print(data["reason"])
+        else:
+            print(f"SUCCESS!, Reject Count = {data['rejectedCount']}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error during scenario {game_state.scenario}: {e}")
+
 
 # CORRELATIONS BASED LOGIC
 
@@ -253,27 +288,31 @@ def calculate_combination_value(
     """
 
     present_attrs = [attr for attr, present in attrs.items() if present]
-    base_value = sum(value_function(rel_freq[attr]) for attr in present_attrs)
-    
-    # urgency_multiplier = 1.0
 
-    # for constraint in constraints:
-    #     attr, min_count = constraint["attribute"], constraint["minCount"]
-    #     if attr in present_attrs:
-    #         expected_count = 1000 * rel_freq[attr]
-    #         shortage_ratio = min_count / expected_count if expected_count > 0 else 1.0
-    #         urgency_multiplier += max(0, shortage_ratio - 1.0)
+    if not present_attrs:
+        return 0.0
+
+    base_value = sum(value_function(rel_freq[attr]) for attr in present_attrs)
+
+    urgency_multiplier = 1.0
+
+    for constraint in constraints:
+        attr, min_count = constraint["attribute"], constraint["minCount"]
+        if attr in present_attrs:
+            expected_count = 1000 * rel_freq[attr]
+            shortage_ratio = min_count / expected_count if expected_count > 0 else 1.0
+            urgency_multiplier += max(0, shortage_ratio - 1.0)
 
     correlation_factor = 1.0
 
     for i, attr1 in enumerate(present_attrs):
         for attr2 in present_attrs[i + 1 :]:
             correlation = correlations.get(attr1, {}).get(attr2, 0.0)
-            if correlation < 0 or correlation > 0.3:
-                correlation_factor -= correlation
+            correlation_factor -= correlation * 0.1
 
+    multi_axis_bonus = 1.0 + (len(present_attrs) - 1) * 0.1
     final_value = (
-        base_value * correlation_factor # * multi_axis_bonus * urgency_multiplier
+        base_value * urgency_multiplier * correlation_factor * multi_axis_bonus
     )
 
     return max(final_value, 0.1)
@@ -296,25 +335,6 @@ def correlation_based_exp_rp(
     person_attributes: dict[str, bool],
     game_state: GameState,
 ) -> Tuple[bool, GameState]:
-    threshold = 0.0
-    can_allow = True
-    needed = 0
-    not_needed = 0
-    for attr, has_attr in person_attributes.items():
-        if not has_attr:
-            threshold += (2 ** game_state.constraints[attr].normalized_utilization) - 1
-            can_allow = can_allow and (
-                game_state.constraints[attr].inverted_dim
-                > game_state.constraints[attr].utilization
-            )
-        if has_attr:
-            if (game_state.accepted - game_state.constraints[attr].utilization) < (
-                game_state.constraints[attr].min_count
-            ):
-                needed += 1
-            else:
-                not_needed += 1
-
     person_value = (
         game_state.value_lookup.get(
             tuple(has_attr for has_attr in person_attributes.values()), 0.0
@@ -323,9 +343,27 @@ def correlation_based_exp_rp(
         else 0.0
     )
 
-    adjusted_person_value = adjust_value(person_value, needed, not_needed, game_state.rejected, game_state.processed)
+    threshold = 0.0
+    can_allow = True
+    needed = 0
+    for attr, has_attr in person_attributes.items():
+        if not has_attr:
+            threshold += (2 ** game_state.constraints[attr].normalized_utilization) - 1
+            can_allow = can_allow and (
+                game_state.constraints[attr].inverted_dim
+                > game_state.constraints[attr].utilization
+            )
+        if has_attr:
+            needed += (
+                1
+                if (game_state.accepted - game_state.constraints[attr].utilization)
+                < (game_state.constraints[attr].min_count)
+                else 0
+            )
 
-    accept = adjusted_person_value >= threshold and can_allow
+    adjusted_threshold = adjust_threshold(threshold, game_state.rejected, needed)
+
+    accept = person_value >= adjusted_threshold and can_allow
 
     if accept:
         for attr_name in game_state.constraints:
@@ -378,48 +416,6 @@ def correl_initialize_game(scenario: int):
     except requests.exceptions.RequestException as e:
         print(f"Error starting new game: {e}")
         return None
-
-def run_game(game_state: GameState, sleep_time: float):
-    # first person, by not specifying accept
-    try:
-        response = requests.get(decide_and_next_url(game_state.game_id, 0))
-        response.raise_for_status()
-        data = response.json()
-        while data["status"] == "running":
-            person = data["nextPerson"]
-            person_attributes = person["attributes"]
-            accept, game_state = should_accept(person_attributes, game_state)
-            if accept:
-                game_state.accepted += 1
-                if not game_state.all_constraints_satisfied:
-                    game_state.all_constraints_satisfied = all(
-                        (game_state.accepted - game_state.constraints[attr].utilization)
-                        >= (game_state.constraints[attr].min_count)
-                        for attr in game_state.constraints.keys()
-                    )
-            else:
-                game_state.rejected += 1
-            sleep(sleep_time)
-            response = requests.get(
-                decide_and_next_url(
-                    game_state.game_id,
-                    person["personIndex"],
-                    accept,
-                )
-            )
-            game_state.processed += 1
-            if game_state.processed % 100 == 0:
-                print(
-                    f"Processed={game_state.processed}; In={game_state.accepted}; Out={game_state.rejected};"
-                )
-            response.raise_for_status()
-            data = response.json()
-        if data["status"] == "failed":
-            print(data["reason"])
-        else:
-            print(f"SUCCESS!, Reject Count = {data['rejectedCount']}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error during scenario {game_state.scenario}: {e}")
 
 
 def main():
