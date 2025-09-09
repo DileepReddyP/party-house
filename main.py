@@ -74,9 +74,10 @@ def calculate_theta(constraints: defaultdict[str, Attribute]) -> float:
 
 
 def adjust_threshold(threshold: float, current_rejects: int, needed: int) -> float:
-    reduction = (current_rejects / MAX_REJECT) ** (1 / ((current_rejects / 100) + 1))
-    needed_reduction = 1 - ( 1 / (needed * 10) if needed > 0 else 0)
-    return threshold * (1.0 - reduction) * needed_reduction
+    boost_exp = 1 / ((current_rejects / 100) + 1)
+    needed_reduction = (0.1 * needed) ** boost_exp
+    reject_reduction = (current_rejects / MAX_REJECT) ** boost_exp
+    return threshold * (1.0 - reject_reduction) * (1.0 - needed_reduction)
 
 
 def read_constraints(
@@ -135,9 +136,10 @@ def exp_rp(
                 < (game_state.constraints[attr].min_count)
                 else 0
             )
-    accept = (
-        value >= adjust_threshold(threshold, game_state.rejected, needed) and can_allow
-    )
+
+    adjusted_threshold = adjust_threshold(threshold, game_state.rejected, needed)
+    accept = value >= adjusted_threshold and can_allow
+
     if accept:
         for attr in game_state.constraints:
             if not person_attributes[attr]:
@@ -308,9 +310,13 @@ def calculate_combination_value(
     for i, attr1 in enumerate(present_attrs):
         for attr2 in present_attrs[i + 1 :]:
             correlation = correlations.get(attr1, {}).get(attr2, 0.0)
-            correlation_factor -= correlation * 0.1
+            if correlation > 0:
+                correlation_factor += correlation * 0.1
+            elif correlation < 0:
+                correlation_factor += abs(correlation) * 0.2
 
     multi_axis_bonus = 1.0 + (len(present_attrs) - 1) * 0.1
+
     final_value = (
         base_value * urgency_multiplier * correlation_factor * multi_axis_bonus
     )
