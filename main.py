@@ -424,6 +424,154 @@ def correl_initialize_game(scenario: int):
         return None
 
 
+def calculate_progress_penalty(game_state: GameState) -> float:
+    """Calculate penalty based on how unevenly constraints are being filled"""
+    if game_state.accepted == 0:
+        return 1.0
+
+    progress_ratios = []
+    for _, constraint in game_state.constraints.items():
+        current_with_attr = game_state.accepted - constraint.utilization
+        target = constraint.min_count
+        progress = current_with_attr / target if target > 0 else 1.0
+        progress_ratios.append(progress)
+
+    # Penalize if progress is very uneven
+    max_progress = max(progress_ratios)
+    min_progress = min(progress_ratios)
+    imbalance = max_progress - min_progress
+
+    # Return penalty multiplier (higher = make threshold harder to meet)
+    return 1.0 + imbalance * 2.0
+
+
+def calculate_constraint_urgency(game_state: GameState) -> dict[str, float]:
+    """Calculate how urgent each constraint is based on remaining capacity and progress"""
+    urgencies = {}
+    total_remaining = CLUB_CAPACITY - game_state.accepted
+
+    for attr_name, constraint in game_state.constraints.items():
+        current_with_attr = game_state.accepted - constraint.utilization
+        still_needed = max(0, constraint.min_count - current_with_attr)
+
+        if still_needed == 0:
+            urgencies[attr_name] = 0.0
+        else:
+            # Higher urgency if we need many more and have little time left
+            expected_future_with_attr = total_remaining * constraint.relative_frequency
+            urgency = still_needed / max(expected_future_with_attr, 1.0)
+            urgencies[attr_name] = urgency
+
+    return urgencies
+
+
+def balanced_correlation_exp_rp(
+    person_attributes: dict[str, bool],
+    game_state: GameState,
+) -> Tuple[bool, GameState]:
+    person_value = (
+        game_state.value_lookup.get(
+            tuple(has_attr for has_attr in person_attributes.values()), 0.0
+        )
+        if game_state.value_lookup
+        else 0.0
+    )
+
+    # Apply urgency weighting to person value
+    urgencies = calculate_constraint_urgency(game_state)
+    urgency_bonus = 0.0
+    for attr_name, has_attr in person_attributes.items():
+        if has_attr:
+            urgency_bonus += urgencies[attr_name] * 0.5  # Tunable weight
+
+    # Boost value for people with urgent attributes
+    person_value = person_value * (1.0 + urgency_bonus)
+
+    # Calculate base threshold
+    threshold = 0.0
+    can_allow = True
+    needed = 0
+
+    for attr, has_attr in person_attributes.items():
+        if not has_attr:
+            # Add urgency penalty for common attributes being filled too fast
+            urgency_penalty = 1.0 + urgencies[attr] * 0.3
+            threshold += (
+                (2 ** game_state.constraints[attr].normalized_utilization) - 1
+            ) * urgency_penalty
+            can_allow = can_allow and (
+                game_state.constraints[attr].inverted_dim
+                > game_state.constraints[attr].utilization
+            )
+        if has_attr:
+            needed += (
+                1
+                if (game_state.accepted - game_state.constraints[attr].utilization)
+                < (game_state.constraints[attr].min_count)
+                else 0
+            )
+
+    # Apply progress-based penalty
+    progress_penalty = calculate_progress_penalty(game_state)
+    adjusted_threshold = adjust_threshold(
+        threshold * progress_penalty, game_state.rejected, needed
+    )
+
+    accept = person_value >= adjusted_threshold and can_allow
+
+    if accept:
+        for attr_name in game_state.constraints:
+            if not person_attributes[attr_name]:
+                attr = game_state.constraints[attr_name]
+                attr.utilization += 1
+                attr.normalized_utilization = norm_util_calc(
+                    attr.utilization,
+                    attr.inverted_dim,
+                    game_state.theta,
+                    attr.alpha_j,
+                )
+
+    return accept, game_state
+
+
+def balanced_initialize_game(scenario: int):
+    """Initialize game with balanced correlation algorithm"""
+    try:
+        response = requests.get(start_game_url(scenario))
+        response.raise_for_status()
+        data = response.json()
+
+        theta, value_lookup = initialize_value_system(data)
+        alpha, aggregate_capacity, constraints = read_constraints(
+            data["constraints"],
+            data["attributeStatistics"]["relativeFrequencies"],
+            data["attributeStatistics"]["correlations"],
+        )
+
+        game_state = GameState(
+            scenario=scenario,
+            game_id=data["gameId"],
+            num_dims=len(constraints),
+            constraints=constraints,
+            aggregate_capacity=aggregate_capacity,
+            alpha=alpha,
+            all_constraints_satisfied=False,
+            theta=theta,
+            accepted=0,
+            rejected=0,
+            processed=0,
+            correlation_matrix=data["attributeStatistics"]["correlations"],
+            value_lookup=value_lookup,
+            game_algorithm=balanced_correlation_exp_rp,  # Use the balanced algorithm
+        )
+
+        return game_state
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error starting new game: {e}")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Berghain Challenge Solver: Online Multi-dimensional Knapsack"
@@ -438,7 +586,7 @@ def main():
     parser.add_argument(
         "--algo",
         type=str,
-        choices=["base", "correl"],
+        choices=["base", "correl", "balanced"],
         default="base",
         help="Modification to OMKP Algorithm",
     )
@@ -455,11 +603,15 @@ def main():
     print(
         f"Starting scenario {scenario} with algorithm {algo} and sleep {sleep_time * 1000}ms:"
     )
-    new_game = (
-        initialize_game(scenario)
-        if algo == "base"
-        else correl_initialize_game(scenario)
-    )
+    if algo == "base":
+        new_game = initialize_game(scenario)
+    elif algo == "correl":
+        new_game = correl_initialize_game(scenario)
+    elif algo == "balanced":
+        new_game = balanced_initialize_game(scenario)
+    else:
+        print(f"Unknown algorithm: {algo}")
+        return
     if new_game is not None:
         run_game(new_game, sleep_time)
 
